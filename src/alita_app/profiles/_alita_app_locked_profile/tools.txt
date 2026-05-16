@@ -1,0 +1,13 @@
+# Alita tool set — existing SDK tools, used with restraint per instructions.txt
+dance
+sweep_look
+play_emotion
+move_head
+head_tracking
+camera
+
+# Knowledge tools
+get_current_time
+get_weather
+read_memory
+write_memory
