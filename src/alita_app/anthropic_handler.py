@@ -23,9 +23,10 @@ from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item
 
 from anthropic import AsyncAnthropic
 
+import sys
+
 from alita_app import store
 from alita_app.config import config, set_custom_profile
-from alita_app.prompts import get_session_instructions
 from alita_app.tools.core_tools import ToolDependencies, get_tool_specs
 from alita_app.tools.background_tool_manager import (
     BackgroundToolManager,
@@ -138,6 +139,9 @@ class AnthropicHandler(AsyncStreamHandler):
         self._key_source: Literal["env", "textbox"] = "env"
         self._provided_api_key: Optional[str] = None
 
+        # System prompt (built once in start_up)
+        self._system_prompt: str = ""
+
         # Lifecycle
         self._shutdown_requested: bool = False
         self._connected_event: asyncio.Event = asyncio.Event()
@@ -169,6 +173,15 @@ class AnthropicHandler(AsyncStreamHandler):
 
         self.client = AsyncAnthropic(api_key=api_key)
         logger.info("Anthropic client initialised (model=%s)", config.MODEL_NAME)
+
+        # ── Build system prompt once ──────────────────────────────────────────
+        try:
+            from alita_app.build_prompt import build_system_prompt
+            self._system_prompt = build_system_prompt()
+            logger.info("System prompt loaded: %d chars", len(self._system_prompt))
+        except FileNotFoundError as e:
+            logger.error("Cannot start without system prompt: %s", e)
+            sys.exit(1)
 
         # ── Load silero-vad ────────────────────────────────────────────────────
         try:
@@ -450,7 +463,7 @@ class AnthropicHandler(AsyncStreamHandler):
                     stream_kwargs: dict[str, Any] = dict(
                         model=config.MODEL_NAME,
                         max_tokens=MAX_CLAUDE_TOKENS,
-                        system=get_session_instructions(),
+                        system=self._system_prompt,
                         messages=self._history,
                     )
                     if force_text:

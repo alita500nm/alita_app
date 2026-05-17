@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 # ── Pfade ────────────────────────────────────────────────────────────
 # Anpassen falls die alita-app-Struktur anders aussieht.
-APP_ROOT = Path(__file__).resolve().parent
+APP_ROOT = Path(__file__).resolve().parent.parent.parent
 PROMPTS_DIR = APP_ROOT / "prompts"
 
 STATIC_PROMPT_PATH = PROMPTS_DIR / "system_prompt.md"

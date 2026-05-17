@@ -17,6 +17,7 @@ import logging
 from typing import List, Optional
 from pathlib import Path
 
+import cv2
 from fastrtc import AdditionalOutputs, audio_to_float32
 from scipy.signal import resample
 
@@ -70,6 +71,47 @@ class LocalStream:
         self._instance_path: Optional[str] = instance_path
         self._settings_initialized = False
         self._asyncio_loop = None
+
+        # Register /stream MJPEG endpoint
+        if self._settings_app is not None:
+            self._register_mjpeg_stream(self._settings_app)
+        else:
+            self._start_standalone_mjpeg()
+
+    def _mjpeg_gen(self):
+        """Yield MJPEG frames from camera_worker."""
+        cam = self.handler.deps.camera_worker
+        while True:
+            frame = cam.get_latest_frame() if cam else None
+            if frame is not None:
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+            time.sleep(0.066)  # ~15 fps
+
+    def _register_mjpeg_stream(self, app) -> None:
+        """Register GET /stream MJPEG endpoint on a FastAPI app."""
+        from fastapi.responses import StreamingResponse
+        streamer = self
+
+        @app.get("/stream")
+        def _mjpeg_stream():
+            return StreamingResponse(streamer._mjpeg_gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+    def _start_standalone_mjpeg(self, port: int = 8001) -> None:
+        """Spin up a lightweight MJPEG server on its own thread when no settings_app exists."""
+        import threading
+        import uvicorn
+
+        app = FastAPI()
+        self._register_mjpeg_stream(app)
+
+        thread = threading.Thread(
+            target=uvicorn.run, args=(app,),
+            kwargs={"host": "0.0.0.0", "port": port, "log_level": "warning"},
+            daemon=True,
+        )
+        thread.start()
+        logger.info("Standalone MJPEG server on http://0.0.0.0:%d/stream", port)
 
     # ---- Settings UI (only when API key is missing) ----
     def _read_env_lines(self, env_path: Path) -> list[str]:
