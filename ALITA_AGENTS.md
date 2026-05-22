@@ -22,10 +22,26 @@ not an assistant. German primary language.
   `localhost:11434` (already running on host). Use for short
   command-style turns to keep latency low; route emotional/longer
   turns to Claude.
-- **STT**: faster-whisper locally, German model
-- **TTS**: Piper, German voice — model already on disk:
-  - Binary: `~/Labor/scripts/piper/piper`
-  - Voice: `~/Labor/scripts/piper/voices/de_DE-eva_k-x_low.onnx`
+- **STT**: **ElevenLabs Scribe v2** (batch upload after silero-VAD
+  end-of-speech detection). Env: `ELEVENLABS_API_KEY`,
+  `ELEVENLABS_STT_MODEL=scribe_v2`. Language pinned to `de`.
+- **TTS**: **ElevenLabs streaming**, `pcm_16000` output. Env:
+  `ELEVENLABS_TTS_MODEL` (default `eleven_turbo_v2_5` for latency;
+  `eleven_v3` for higher German expressiveness at ~3× first-audio
+  latency) and `ELEVENLABS_TTS_VOICE_ID`. Voice picked from the
+  shared library — candidate German voices: Clara (warm, calm, mid-40s)
+  and Sina (warm, approachable, 30s).
+- **Wake mechanism (no audio listening in HIBERNATE)**: external
+  trigger via `POST /api/wake`, `POST /api/wake/conversation`,
+  `POST /api/sleep` on the FastAPI app, or `SIGUSR1`/`SIGUSR2`
+  signals as a headless fallback. Vosk wake-word detection was
+  removed — too many false triggers from background TV/noise.
+- **Local fallback audio (on disk only, NOT in code paths)**:
+  - `~/Labor/scripts/piper/piper` (binary)
+  - `~/Labor/scripts/piper/voices/de_DE-eva_k-x_low.onnx`
+  - `vosk-model-small-de-0.15` (HF cache)
+  Kept available for manual reactivation if ElevenLabs is down or
+  offline operation is needed; the code no longer references them.
 - **Memory**: SQLite (working schema in `~/alita_app_rescue/store.py` —
   re-use or adapt, don't reinvent)
 
@@ -59,9 +75,11 @@ port to whichever prompt-file location the template uses
 
 ## What NOT to do
 
-- Don't create a new venv (use `~/dev/reachy/.venv/`)
+- Don't create a new venv (use `~/dev/alita_app/.venv/`)
 - Don't write a `requirements.txt` (we use `pyproject.toml`)
 - Don't add OpenAI, OpenAI Realtime, or any non-Anthropic LLM API
+- Don't add Google APIs (Gemini/Speech-to-Text/etc.)
+- Don't reintroduce Vosk wake-word listening — manual wake only
 - Don't reintroduce dance/emotion mass-exposure to the LLM after
   curating the tool set
 - Don't commit `data/memory.db` or any `.env` files
@@ -82,8 +100,12 @@ sessions) is what we want.
 ## Status
 
 - 14. Mai 2026: conversation template freshly generated.
-  Replacement of OpenAI → Anthropic is the first big task,
-  followed by integrating Piper TTS and the qwen fallback route.
+  Replacement of OpenAI → Anthropic done; integrated Piper TTS and
+  the qwen fallback route on top.
+- 19. Mai 2026: STT/TTS migrated to ElevenLabs (Scribe v2 + streaming
+  TTS). Vosk wake-word removed; wake is now manual via HTTP or
+  SIGUSR1/2. Piper binary + voice file remain on disk as a manual
+  fallback only.
 
 ---
 

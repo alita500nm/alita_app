@@ -106,9 +106,13 @@ class Config:
 
     # Required
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
     # Optional
     MODEL_NAME = os.getenv("MODEL_NAME", "claude-sonnet-4-5-20250929")
+    ELEVENLABS_TTS_MODEL = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_turbo_v2_5")
+    ELEVENLABS_TTS_VOICE_ID = os.getenv("ELEVENLABS_TTS_VOICE_ID", "")
+    ELEVENLABS_STT_MODEL = os.getenv("ELEVENLABS_STT_MODEL", "scribe_v2")
     HF_HOME = os.getenv("HF_HOME", "./cache")
     LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set

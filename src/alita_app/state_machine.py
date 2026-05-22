@@ -57,7 +57,7 @@ class StateMachine:
     """Tracks Alita's operational state."""
 
     def __init__(self) -> None:
-        self.state = AlitaState.HIBERNATE
+        self.state = AlitaState.CONVERSATION
         self.last_activity_time = time.monotonic()
 
     def transition(self, new_state: AlitaState) -> None:

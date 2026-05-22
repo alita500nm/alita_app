@@ -1,43 +1,51 @@
 """Anthropic-based conversation handler for Reachy Mini.
 
-Replaces OpenAI Realtime with a local pipeline:
-  Mic → silero-vad → faster-whisper STT → Anthropic Claude → Piper TTS → Speaker
+Audio pipeline:
+  Mic → silero-vad → ElevenLabs Scribe v2 STT → Anthropic Claude
+      → ElevenLabs TTS (pcm_16000) → Speaker
 
 Public interface mirrors the old OpenaiRealtimeHandler so the rest of the
 app (main.py, console.py, headless_personality_ui.py) needs minimal changes.
+
+Default state is CONVERSATION (app is launched explicitly when the user
+wants to talk). HIBERNATE is an opt-in pause state, reachable via
+`POST /api/sleep`, the SIGUSR2 signal, or the "alita schlaf" voice command.
+Re-wake via `POST /api/wake` or SIGUSR1.
+
+Local Piper binary + de_DE-eva_k-x_low.onnx voice file remain on disk at
+~/Labor/scripts/piper/ as an offline fallback (re-enable manually if needed).
 """
 
+import io
 import re
+import sys
 import json
 import base64
 import asyncio
 import logging
+from typing import Any, Dict, Final, Tuple, Literal, Optional
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, Final, Literal, Optional, Tuple
 
 import numpy as np
+from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item
+from anthropic import AsyncAnthropic
 from numpy.typing import NDArray
 from scipy.signal import resample
-from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item
-
-from anthropic import AsyncAnthropic
-
-import sys
+from elevenlabs.client import AsyncElevenLabs
 
 from alita_app import store
 from alita_app.config import config, set_custom_profile
-from alita_app.tools.core_tools import ToolDependencies, get_tool_specs
-from alita_app.tools.background_tool_manager import (
-    BackgroundToolManager,
-    ToolCallRoutine,
-    ToolNotification,
-)
 from alita_app.state_machine import (
     AlitaState,
     StateMachine,
     detect_wake_command,
     random_wake_confirmation,
+)
+from alita_app.tools.core_tools import ToolDependencies, get_tool_specs
+from alita_app.tools.background_tool_manager import (
+    ToolCallRoutine,
+    ToolNotification,
+    BackgroundToolManager,
 )
 
 
@@ -45,13 +53,8 @@ logger = logging.getLogger(__name__)
 
 # ── Audio constants ────────────────────────────────────────────────────────────
 
-WHISPER_SAMPLE_RATE: Final[int] = 16_000   # faster-whisper expects 16 kHz float32
-PIPER_SAMPLE_RATE: Final[int] = 16_000     # de_DE-eva_k-x_low outputs 16 kHz
-
-PIPER_BINARY: Final[Path] = Path.home() / "Labor/scripts/piper/piper"
-PIPER_VOICE: Final[Path] = (
-    Path.home() / "Labor/scripts/piper/voices/de_DE-eva_k-x_low.onnx"
-)
+STT_SAMPLE_RATE: Final[int] = 16_000   # mic → VAD → Scribe v2 (WAV 16 kHz mono)
+TTS_SAMPLE_RATE: Final[int] = 16_000   # ElevenLabs pcm_16000 output
 
 # ── VAD constants ──────────────────────────────────────────────────────────────
 
@@ -93,8 +96,8 @@ class AnthropicHandler(AsyncStreamHandler):
     ) -> None:
         super().__init__(
             expected_layout="mono",
-            output_sample_rate=PIPER_SAMPLE_RATE,
-            input_sample_rate=WHISPER_SAMPLE_RATE,
+            output_sample_rate=TTS_SAMPLE_RATE,
+            input_sample_rate=STT_SAMPLE_RATE,
         )
 
         self.deps = deps
@@ -104,6 +107,9 @@ class AnthropicHandler(AsyncStreamHandler):
         # Anthropic client (set in start_up)
         self.client: Optional[AsyncAnthropic] = None
 
+        # ElevenLabs client (set in start_up)
+        self.eleven: Optional[AsyncElevenLabs] = None
+
         # Output queue shared between _tts_and_queue and emit()
         self.output_queue: asyncio.Queue[
             Tuple[int, NDArray[np.int16]] | AdditionalOutputs
@@ -112,11 +118,9 @@ class AnthropicHandler(AsyncStreamHandler):
         # State machine
         self.state_machine = StateMachine()
 
-        # VAD / STT state
+        # VAD state
         self._vad_model: Any = None
         self._vad_iterator: Any = None
-        self._whisper: Any = None
-        self._vosk_model: Any = None  # lightweight wake-word recognizer
         self._speaking: bool = False
         self._speech_buf: list[NDArray] = []
         self._vad_buf: NDArray = np.array([], dtype=np.float32)
@@ -154,6 +158,10 @@ class AnthropicHandler(AsyncStreamHandler):
 
     async def start_up(self) -> None:
         """Initialise client, VAD, Whisper, store, and history, then run idle loop."""
+        # Idempotent: start_up may be called both proactively at app launch
+        # (main.py) and reactively by fastrtc on websocket-connect.
+        if self._connected_event.is_set():
+            return
         self.start_time = asyncio.get_event_loop().time()
         self.last_activity_time = self.start_time
 
@@ -174,6 +182,20 @@ class AnthropicHandler(AsyncStreamHandler):
         self.client = AsyncAnthropic(api_key=api_key)
         logger.info("Anthropic client initialised (model=%s)", config.MODEL_NAME)
 
+        # ── ElevenLabs client (STT + TTS) ─────────────────────────────────────
+        el_key = config.ELEVENLABS_API_KEY
+        if not el_key or not el_key.strip():
+            logger.warning("ELEVENLABS_API_KEY missing — audio I/O will be disabled.")
+            self.eleven = None
+        else:
+            self.eleven = AsyncElevenLabs(api_key=el_key)
+            logger.info(
+                "ElevenLabs client initialised (stt=%s, tts=%s, voice_id=%s)",
+                config.ELEVENLABS_STT_MODEL,
+                config.ELEVENLABS_TTS_MODEL,
+                config.ELEVENLABS_TTS_VOICE_ID or "<unset>",
+            )
+
         # ── Build system prompt once ──────────────────────────────────────────
         try:
             from alita_app.build_prompt import build_system_prompt
@@ -185,34 +207,17 @@ class AnthropicHandler(AsyncStreamHandler):
 
         # ── Load silero-vad ────────────────────────────────────────────────────
         try:
-            from silero_vad import load_silero_vad, VADIterator  # type: ignore[import]
+            from silero_vad import VADIterator, load_silero_vad  # type: ignore[import]
             self._vad_model = load_silero_vad()
             self._vad_iterator = VADIterator(
                 self._vad_model,
-                sampling_rate=WHISPER_SAMPLE_RATE,
+                sampling_rate=STT_SAMPLE_RATE,
                 threshold=VAD_THRESHOLD,
                 min_silence_duration_ms=MIN_SILENCE_MS,
             )
             logger.info("silero-vad loaded")
         except Exception as e:
             logger.error("Failed to load silero-vad: %s — mic input disabled", e)
-
-        # ── Load faster-whisper ────────────────────────────────────────────────
-        try:
-            from faster_whisper import WhisperModel  # type: ignore[import]
-            self._whisper = WhisperModel("base", device="cpu", compute_type="int8")
-            logger.info("faster-whisper loaded (base, cpu, int8)")
-        except Exception as e:
-            logger.error("Failed to load faster-whisper: %s — STT disabled", e)
-
-        # ── Load Vosk for wake-word detection in HIBERNATE ────────────────────
-        try:
-            from vosk import Model as VoskModel, SetLogLevel  # type: ignore[import]
-            SetLogLevel(-1)  # suppress Vosk info logs
-            self._vosk_model = VoskModel(model_name="vosk-model-small-de-0.15")
-            logger.info("Vosk loaded (vosk-model-small-de-0.15)")
-        except Exception as e:
-            logger.warning("Failed to load Vosk: %s — will use Whisper for wake-word detection", e)
 
         # ── Init store and load history ────────────────────────────────────────
         try:
@@ -226,14 +231,15 @@ class AnthropicHandler(AsyncStreamHandler):
         # ── Start background tool manager ──────────────────────────────────────
         self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
-        # Start in HIBERNATE: disable face tracking and movement until wake-word
+        # Start active: head tracking on, movement enabled. HIBERNATE is now
+        # opt-in via /api/sleep (see _enter_hibernate for the inverse setup).
         if self.deps.camera_worker is not None:
-            self.deps.camera_worker.set_head_tracking_enabled(False)
+            self.deps.camera_worker.set_head_tracking_enabled(True)
         if self.deps.movement_manager is not None:
-            self.deps.movement_manager.set_hibernating(True)
+            self.deps.movement_manager.set_hibernating(False)
 
         self._connected_event.set()
-        logger.info("AnthropicHandler ready (state=HIBERNATE, waiting for wake-word)")
+        logger.info("AnthropicHandler ready (state=CONVERSATION, active)")
 
         # Keep running until shutdown (emit() drives idle; this task stays alive)
         try:
@@ -246,23 +252,26 @@ class AnthropicHandler(AsyncStreamHandler):
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive mic frame, run VAD, and trigger STT+Claude on end-of-speech."""
-        if self._vad_iterator is None or self._whisper is None:
+        # HIBERNATE: discard all mic input — wake happens externally.
+        if self.state_machine.state == AlitaState.HIBERNATE:
+            return
+
+        if self._vad_iterator is None or self.eleven is None:
             return
 
         input_rate, audio = frame
 
-        # Flatten to 1-D
+        # Flatten to 1-D (handles (N,), (N, 1), (N, C) — picks channel 0)
         if audio.ndim == 2:
             if audio.shape[1] > audio.shape[0]:
                 audio = audio.T
-            if audio.shape[1] > 1:
-                audio = audio[:, 0]
+            audio = audio[:, 0]
         else:
             audio = audio.flatten()
 
         # Resample to 16 kHz if needed
-        if input_rate != WHISPER_SAMPLE_RATE:
-            audio = resample(audio, int(len(audio) * WHISPER_SAMPLE_RATE / input_rate))
+        if input_rate != STT_SAMPLE_RATE:
+            audio = resample(audio, int(len(audio) * STT_SAMPLE_RATE / input_rate))
 
         # Convert to float32 in [-1, 1] for VAD
         if audio.dtype in (np.float32, np.float64):
@@ -305,43 +314,19 @@ class AnthropicHandler(AsyncStreamHandler):
     # ── STT ───────────────────────────────────────────────────────────────────
 
     async def _process_speech(self, audio: NDArray) -> None:
-        """Route speech through state machine: wake-word check or full STT+Claude."""
-        if len(audio) < WHISPER_SAMPLE_RATE * 0.3:  # ignore < 0.3 s
+        """Transcribe captured speech via Scribe v2 and route to Claude."""
+        if len(audio) < STT_SAMPLE_RATE * 0.3:  # ignore < 0.3 s
             logger.debug("STT: audio too short (%d samples), skipping", len(audio))
             return
 
-        # ── HIBERNATE: check for wake-word only (Vosk or Whisper fallback) ──
-        if self.state_machine.state == AlitaState.HIBERNATE:
-            text = await self._transcribe_wake_word(audio)
-            if not text:
-                return
-            cmd = detect_wake_command(text)
-            if cmd == "listen":
-                logger.info("Wake-word detected: %r -> LISTENING", text)
-                self.state_machine.transition(AlitaState.LISTENING)
-                await self._on_wake()
-            elif cmd == "conversation":
-                logger.info("Wake-word detected: %r -> CONVERSATION", text)
-                self.state_machine.transition(AlitaState.CONVERSATION)
-                await self._on_wake()
-            else:
-                logger.debug("HIBERNATE: ignored speech %r", text[:60])
-            return
-
-        # ── LISTENING / CONVERSATION: full Whisper STT ──
         if self._call_lock.locked():
             logger.debug("STT: Claude call in progress, dropping speech frame")
             return
 
         self.state_machine.touch()
 
-        loop = asyncio.get_running_loop()
         try:
-            segments, _ = await loop.run_in_executor(
-                None,
-                lambda: self._whisper.transcribe(audio, language="de", beam_size=5),
-            )
-            text = " ".join(s.text.strip() for s in segments).strip()
+            text = await self._scribe_transcribe(audio)
         except Exception as e:
             logger.error("STT error: %s", e)
             return
@@ -350,7 +335,7 @@ class AnthropicHandler(AsyncStreamHandler):
             logger.debug("STT: empty transcript, skipping")
             return
 
-        # Check for state-change commands in the transcript
+        # In-conversation voice commands (sleep / stay-awake)
         cmd = detect_wake_command(text)
         if cmd == "sleep":
             logger.info("Sleep command detected: %r", text)
@@ -371,41 +356,31 @@ class AnthropicHandler(AsyncStreamHandler):
         if self.state_machine.state == AlitaState.LISTENING:
             self._enter_hibernate()
 
-    # ── Wake-word transcription (Vosk or Whisper fallback) ────────────────
+    async def _scribe_transcribe(self, audio: NDArray) -> str:
+        """Send float32 mono audio @ 16 kHz to ElevenLabs Scribe v2 and return text."""
+        if self.eleven is None:
+            return ""
 
-    async def _transcribe_wake_word(self, audio: NDArray) -> str:
-        """Transcribe short audio for wake-word detection using Vosk (fast, local)."""
-        loop = asyncio.get_running_loop()
+        # Build a WAV blob in-memory (Scribe wants a file-like upload).
+        wav_buf = io.BytesIO()
+        import soundfile as sf  # late import keeps top-of-file lean
+        audio_f32 = audio.astype(np.float32, copy=False)
+        sf.write(wav_buf, audio_f32, STT_SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        wav_buf.seek(0)
+        wav_buf.name = "speech.wav"  # SDK uses .name for the multipart filename
 
-        if self._vosk_model is not None:
-            try:
-                return await loop.run_in_executor(None, self._vosk_recognize, audio)
-            except Exception as e:
-                logger.warning("Vosk recognition failed: %s, falling back to Whisper", e)
-
-        # Fallback to Whisper if Vosk unavailable
-        if self._whisper is not None:
-            try:
-                segments, _ = await loop.run_in_executor(
-                    None,
-                    lambda: self._whisper.transcribe(audio, language="de", beam_size=1),
-                )
-                return " ".join(s.text.strip() for s in segments).strip()
-            except Exception as e:
-                logger.error("Whisper fallback error: %s", e)
-        return ""
-
-    def _vosk_recognize(self, audio: NDArray) -> str:
-        """Synchronous Vosk recognition (called in executor)."""
-        import json as _json
-        from vosk import KaldiRecognizer  # type: ignore[import]
-
-        rec = KaldiRecognizer(self._vosk_model, WHISPER_SAMPLE_RATE)
-        # Vosk expects int16 PCM bytes
-        audio_int16 = (audio * 32768).clip(-32768, 32767).astype(np.int16)
-        rec.AcceptWaveform(audio_int16.tobytes())
-        result = _json.loads(rec.FinalResult())
-        return result.get("text", "").strip()
+        t0 = asyncio.get_event_loop().time()
+        resp = await self.eleven.speech_to_text.convert(
+            model_id=config.ELEVENLABS_STT_MODEL,
+            file=wav_buf,
+            language_code="de",
+            tag_audio_events=False,
+            diarize=False,
+        )
+        dt_ms = (asyncio.get_event_loop().time() - t0) * 1000
+        text = (getattr(resp, "text", None) or "").strip()
+        logger.info("STT latency=%.0fms, %d chars", dt_ms, len(text))
+        return text
 
     # ── State transition helpers ──────────────────────────────────────────
 
@@ -426,6 +401,29 @@ class AnthropicHandler(AsyncStreamHandler):
             self.deps.camera_worker.set_head_tracking_enabled(False)
         if self.deps.movement_manager is not None:
             self.deps.movement_manager.set_hibernating(True)
+        # Drop any speech buffered before sleep to avoid replay on next wake.
+        self._speaking = False
+        self._speech_buf = []
+        self._vad_buf = np.array([], dtype=np.float32)
+
+    # ── Public wake/sleep API (HTTP endpoints + signal handlers call into here) ──
+
+    async def wake(self) -> None:
+        """External trigger: transition HIBERNATE → CONVERSATION (open session)."""
+        if self.state_machine.state != AlitaState.HIBERNATE:
+            logger.debug("wake: not hibernating (state=%s)", self.state_machine.state.value)
+            return
+        logger.info("External wake → CONVERSATION")
+        self.state_machine.transition(AlitaState.CONVERSATION)
+        await self._on_wake()
+
+    async def force_sleep(self) -> None:
+        """External trigger: transition to HIBERNATE."""
+        if self.state_machine.state == AlitaState.HIBERNATE:
+            return
+        logger.info("External sleep → HIBERNATE")
+        await self._tts_and_queue("Schlafe ein.")
+        self._enter_hibernate()
 
     # ── Claude call ────────────────────────────────────────────────────────────
 
@@ -661,43 +659,62 @@ class AnthropicHandler(AsyncStreamHandler):
     # ── TTS ───────────────────────────────────────────────────────────────────
 
     async def _tts_and_queue(self, text: str) -> None:
-        """Synthesise text with Piper and push audio frames to output_queue."""
+        """Synthesise text via ElevenLabs streaming and push audio frames to output_queue."""
         text = text.strip()
         if not text:
             return
 
-        if not PIPER_BINARY.exists():
-            logger.warning("Piper binary not found at %s — skipping TTS", PIPER_BINARY)
+        if self.eleven is None:
+            logger.warning("TTS skipped: ElevenLabs client not configured")
+            return
+        voice_id = config.ELEVENLABS_TTS_VOICE_ID
+        if not voice_id:
+            logger.warning("TTS skipped: ELEVENLABS_TTS_VOICE_ID not set")
             return
 
+        t0 = asyncio.get_event_loop().time()
+        first_chunk_at: Optional[float] = None
+        total_bytes = 0
+        pending = bytearray()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                str(PIPER_BINARY),
-                "--model", str(PIPER_VOICE),
-                "--output_raw",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+            stream = self.eleven.text_to_speech.stream(
+                voice_id=voice_id,
+                text=text,
+                model_id=config.ELEVENLABS_TTS_MODEL,
+                output_format="pcm_16000",
+                language_code="de",
             )
-            stdout, _ = await proc.communicate(input=text.encode("utf-8"))
+            async for chunk in stream:
+                if not chunk:
+                    continue
+                if first_chunk_at is None:
+                    first_chunk_at = asyncio.get_event_loop().time()
+                pending.extend(chunk)
+                total_bytes += len(chunk)
+                # Emit on 2-byte (int16) boundary, otherwise frombuffer fails.
+                emit_len = len(pending) - (len(pending) % 2)
+                if emit_len == 0:
+                    continue
+                frame = bytes(pending[:emit_len])
+                del pending[:emit_len]
+
+                audio = np.frombuffer(frame, dtype=np.int16).reshape(1, -1)
+                if self.deps.head_wobbler is not None:
+                    self.deps.head_wobbler.feed(base64.b64encode(frame).decode())
+                await self.output_queue.put((TTS_SAMPLE_RATE, audio))
         except Exception as e:
-            logger.error("Piper TTS error: %s", e)
+            logger.error("ElevenLabs TTS error: %s", e)
             return
 
-        if not stdout:
-            logger.warning("DIAG _tts_and_queue: Piper returned empty stdout for %r", text[:80])
+        if total_bytes == 0:
+            logger.warning("TTS: empty stream for %r", text[:80])
             return
-
-        logger.info("DIAG _tts_and_queue: Piper produced %d bytes for %r", len(stdout), text[:80])
-
-        # Drive head wobble from raw PCM bytes (same as OpenAI audio delta)
-        if self.deps.head_wobbler is not None:
-            self.deps.head_wobbler.feed(base64.b64encode(stdout).decode())
-
-        # Push int16 PCM to output queue
-        audio = np.frombuffer(stdout, dtype=np.int16).reshape(1, -1)
-        logger.info("DIAG _tts_and_queue: queuing audio shape=%s max=%d", audio.shape, int(abs(audio).max()))
-        await self.output_queue.put((PIPER_SAMPLE_RATE, audio))
+        first_ms = ((first_chunk_at or t0) - t0) * 1000
+        total_ms = (asyncio.get_event_loop().time() - t0) * 1000
+        logger.info(
+            "TTS first_chunk=%.0fms total=%.0fms bytes=%d text=%r",
+            first_ms, total_ms, total_bytes, text[:80],
+        )
 
     # ── Emit (fastrtc periodic pull) ───────────────────────────────────────────
 

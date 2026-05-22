@@ -59,3 +59,7 @@ cache/
 
 # User-created personalities (managed by UI)
 src/alita_app/profiles/user_personalities/
+
+# Local working files (per-clone, not versioned)
+agents.local.md
+plan.md

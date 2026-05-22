@@ -3,7 +3,9 @@
 import os
 import sys
 import time
+import signal
 import asyncio
+import logging
 import argparse
 import threading
 from typing import Any, Dict, List, Optional
@@ -45,8 +47,8 @@ def run(
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from alita_app.moves import MovementManager
     from alita_app.console import LocalStream
-    from alita_app.anthropic_handler import AnthropicHandler
     from alita_app.tools.core_tools import ToolDependencies
+    from alita_app.anthropic_handler import AnthropicHandler
     from alita_app.audio.head_wobbler import HeadWobbler
 
     logger = setup_logger(args.debug)
@@ -136,6 +138,7 @@ def run(
     handler = AnthropicHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
 
     stream_manager: gr.Blocks | LocalStream | None = None
+    http_app: Optional[FastAPI] = None  # FastAPI to serve via uvicorn (gradio mode only)
 
     if args.gradio:
         api_key_textbox = gr.Textbox(
@@ -170,7 +173,9 @@ def run(
 
         personality_ui.wire_events(handler, stream_manager)
 
-        app = gr.mount_gradio_app(app, stream.ui, path="/")
+        _mount_wake_routes(app, handler)
+        _mount_handler_startup(app, handler)
+        http_app = gr.mount_gradio_app(app, stream.ui, path="/")
     else:
         # In headless mode, wire settings_app + instance_path to console LocalStream
         stream_manager = LocalStream(
@@ -179,6 +184,15 @@ def run(
             settings_app=settings_app,
             instance_path=instance_path,
         )
+        # Expose wake/sleep endpoints. Prefer the ReachyMiniApp runtime's
+        # settings_app when available; otherwise spin up our own on 7860.
+        if settings_app is not None:
+            _mount_wake_routes(settings_app, handler)
+        else:
+            _start_standalone_wake_server(handler, port=7860)
+
+    # Universal manual-wake fallback (works in any mode).
+    _install_wake_signal_handlers(handler)
 
     # Each async service → its own thread/loop
     movement_manager.start()
@@ -203,7 +217,11 @@ def run(
         threading.Thread(target=poll_stop_event, daemon=True).start()
 
     try:
-        stream_manager.launch()
+        if http_app is not None:
+            import uvicorn
+            uvicorn.run(http_app, host="0.0.0.0", port=7860, log_level="warning")
+        else:
+            stream_manager.launch()
     except KeyboardInterrupt:
         logger.info("Keyboard interruption in main thread... closing server.")
     finally:
@@ -224,6 +242,94 @@ def run(
         robot.client.disconnect()
         time.sleep(1)
         logger.info("Shutdown complete.")
+
+
+def _mount_wake_routes(app: "FastAPI", handler: "Any") -> None:
+    """Register POST /api/wake and POST /api/sleep on the FastAPI app.
+
+    Wake  = HIBERNATE → CONVERSATION (open multi-turn session).
+    Sleep = whatever state → HIBERNATE (mic muted, no movement).
+
+    Default state at app launch is CONVERSATION, so wake is only useful
+    after an explicit sleep.
+
+    Trigger from the shell:
+      curl -X POST http://localhost:7860/api/wake
+      curl -X POST http://localhost:7860/api/sleep
+    """
+    @app.post("/api/wake")
+    async def _wake() -> Dict[str, str]:
+        await handler.wake()
+        return {"state": handler.state_machine.state.value}
+
+    @app.post("/api/sleep")
+    async def _sleep() -> Dict[str, str]:
+        await handler.force_sleep()
+        return {"state": handler.state_machine.state.value}
+
+
+def _mount_handler_startup(app: "FastAPI", handler: "Any") -> None:
+    """Schedule handler.start_up() on uvicorn boot.
+
+    In gradio mode, fastrtc only calls handler.start_up() when a browser
+    opens a websocket. We want the ElevenLabs/VAD/store init to happen
+    immediately so external wake (curl/SIGUSR1) and headless audio work
+    without a browser. start_up() is idempotent (guards on _connected_event).
+    """
+    @app.on_event("startup")
+    async def _bootstrap() -> None:
+        asyncio.create_task(handler.start_up(), name="alita-handler-startup")
+
+
+def _start_standalone_wake_server(handler: "Any", port: int = 7860) -> None:
+    """Run a tiny FastAPI on its own thread for wake/sleep endpoints.
+
+    Used in headless mode when no settings_app from ReachyMiniApp runtime is
+    available — gives `curl -X POST http://localhost:7860/api/wake` a home.
+    """
+    import uvicorn
+
+    app = FastAPI()
+    _mount_wake_routes(app, handler)
+    thread = threading.Thread(
+        target=uvicorn.run,
+        args=(app,),
+        kwargs={"host": "0.0.0.0", "port": port, "log_level": "warning"},
+        daemon=True,
+    )
+    thread.start()
+    logging.getLogger(__name__).info(
+        "Standalone wake server on http://0.0.0.0:%d/api/wake", port
+    )
+
+
+def _install_wake_signal_handlers(handler: "Any") -> None:
+    """SIGUSR1 = wake (HIBERNATE → CONVERSATION), SIGUSR2 = sleep. Any run mode."""
+    main_loop: Optional[asyncio.AbstractEventLoop] = None
+    try:
+        main_loop = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        main_loop = None
+
+    def _schedule(coro_fn: Any) -> None:
+        try:
+            loop = main_loop or asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(coro_fn(), loop)
+        except Exception:
+            pass
+
+    def _on_usr1(_signum: int, _frame: Any) -> None:
+        _schedule(handler.wake)
+
+    def _on_usr2(_signum: int, _frame: Any) -> None:
+        _schedule(handler.force_sleep)
+
+    try:
+        signal.signal(signal.SIGUSR1, _on_usr1)
+        signal.signal(signal.SIGUSR2, _on_usr2)
+    except (ValueError, AttributeError):
+        # ValueError if not main thread (e.g. ReachyMiniApp launches us in a thread).
+        pass
 
 
 class AlitaApp(ReachyMiniApp):  # type: ignore[misc]
